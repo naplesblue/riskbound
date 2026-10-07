@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from riskbound import cli, compute, data, evidence, rules
+from riskbound import cli, compute, data, evidence, rules, track
 
 TODAY = "2026-10-06"
 
@@ -16,6 +16,12 @@ def _bars(n, seed):
     c = 100 * np.exp(np.cumsum(0.02 * rng.standard_normal(n)))
     idx = pd.bdate_range("2019-06-03", periods=n)
     return pd.DataFrame({"O": c, "H": c * 1.01, "L": c * 0.99, "C": c, "V": np.full(n, 1e6)}, index=idx)
+
+
+@pytest.fixture(autouse=True)
+def no_forward_log(tmp_path, monkeypatch):
+    """Isolate every CLI call from the repository's real track/daily.jsonl (forward_track_since reads it)."""
+    monkeypatch.setattr(track, "DAILY_FILE", tmp_path / "track" / "daily.jsonl")
 
 
 @pytest.fixture

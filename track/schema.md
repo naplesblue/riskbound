@@ -7,7 +7,7 @@
 | 文件 | 内容 |
 |---|---|
 | `daily.jsonl` | 每行一个 (asof, symbol) 记录，UTF-8，`\n` 换行，键序固定 |
-| `observations.jsonl` | GitHub PushEvent 的转录（推送到达公开远端的时间），独立哈希链 |
+| `observations.jsonl` | GitHub 仓库 activity API 推送记录的转录（新 head 到达公开远端的时间），独立哈希链 |
 
 不保存 OHLCV 行情文件或缓存；每行只带当日一个复权收盘价（`close`）。
 
@@ -39,15 +39,23 @@
 
 | field | type | meaning |
 |---|---|---|
-| `event_id` | string | GitHub event id (unique in the file) |
-| `push_time` | ISO 8601 UTC | event `created_at`: when the push reached the public remote, recorded by GitHub |
-| `head_sha` | 40 hex | `payload.head` |
-| `commits` | list of 40 hex | `payload.commits[].sha` |
+| `event_id` | string | activity `id` (unique in the file) |
+| `push_time` | ISO 8601 UTC | activity `timestamp`: when the push reached the public remote, recorded by GitHub; seconds, `+00:00` |
+| `head_sha` | 40 hex | activity `after`: the new head of the ref |
+| `commits` | list of 40 hex | always `[]` for this source (the activity API lists no commits) |
 | `repo` | `OWNER/REPO` | repository observed |
-| `observed_at` | ISO 8601 UTC | when `riskbound track observe` fetched the event |
+| `observed_at` | ISO 8601 UTC | when `riskbound track observe` fetched the activity |
 | `prev_hash`, `row_hash` | hex | same chain rules as `daily.jsonl`, independent chain |
 
-只保存上述字段，不保存事件中的提交者姓名、邮箱、提交消息或 URL。
+### 来源：GitHub 仓库 activity API
+
+- 接口：`GET /repos/{owner}/{repo}/activity?per_page=100&ref=refs/heads/main`（需认证；Actions 中用 `GITHUB_TOKEN`），按响应头 `Link` 的 `rel="next"` 翻页，每次至多 10 页。
+- 只记录 `ref` 等于被观测分支（默认 `refs/heads/main`）、且 `activity_type` 为 `push`、`force_push`、`branch_creation` 的条目——这三类会把分支指向一个新 head。`branch_deletion`、`pr_merge`、`merge_queue_merge` 等其它类型与其它分支的条目不记录；`after` 不是 40 位十六进制 SHA、或 `id` / `timestamp` 无效的条目整条丢弃。
+- `timestamp` 由 GitHub 记录，是推送到达 GitHub 的时间，即公开时间的来源；`after` 记为 `head_sha`。
+- 该接口**不列出提交**，所以 `commits` 恒为空列表；字段保留是为了不改变文件格式。一行是否被某条观测「覆盖」，靠 `head_sha` 等于引入提交，或引入提交是 `head_sha` 的祖先（祖先关系在本地 git 中判定）。
+- 只保存上述字段，不保存 activity 中的 `actor`、`node_id`、`before` 或任何 URL。
+- **保留期以 GitHub 文档为准**，本项目不假定具体天数；过了保留期的推送无法再观测。因此 `observe` 仍需**每日运行**（Actions 中在 append 之后的独立 job 执行），错过的观测不能事后补造。
+- **force push 的后果**：被 force push 移出公开分支的提交，即使之前有观测覆盖，也不再可达于公开 ref，相应行回到 `unpublished`。这是期望行为：公开状态先看「现在是否仍在公开分支上」，再看观测时间。
 
 ## 规范化与哈希
 

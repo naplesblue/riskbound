@@ -10,15 +10,15 @@
 | state | 含义 |
 |---|---|
 | `unpublished` | 引入这一行的提交还不在公开分支上（本地已提交但未推送，也属于这一态） |
-| `published_unverified` | 已在公开分支上，但没有任何 PushEvent 观测覆盖该提交；**永久不计入**，因为观测缺失无法事后补造 |
-| `late` | 覆盖该提交的最早 PushEvent 时间晚于 deadline |
-| `forward` | 覆盖该提交的最早 PushEvent 时间不晚于 deadline（asof 之后第一个工作日 09:30 美东） |
+| `published_unverified` | 已在公开分支上，但没有任何推送观测覆盖该提交；**永久不计入**，因为观测缺失无法事后补造 |
+| `late` | 覆盖该提交的最早推送观测时间晚于 deadline |
+| `forward` | 覆盖该提交的最早推送观测时间不晚于 deadline（asof 之后第一个工作日 09:30 美东） |
 
-「覆盖」指：引入提交在事件的 `commits` 中，或等于 `head_sha`，或是 `head_sha` 的祖先。
+「覆盖」指：引入提交等于观测的 `head_sha`，或是 `head_sha` 的祖先（仓库 activity API 不列出提交，`commits` 恒为空）。被 force push 移出公开分支的提交不再可达，相应行回到 `unpublished`，即使之前被观测过。
 
 ## 可信度边界
 
-- **PushEvent 由 GitHub 记录**，第三方可以在保留期内通过 GitHub 事件接口独立核对（事件 id 记在 `observations.jsonl`）。GitHub 事件流只保留有限天数、有条数上限和可见延迟，所以 `observe` 必须在推送后及时、重复地运行；错过的观测不能补，相应行会一直是 `published_unverified`。
+- **推送时间由 GitHub 记录**：来源是仓库 activity API（`GET /repos/{owner}/{repo}/activity`）的 `timestamp`，第三方可以在保留期内用同一接口独立核对（activity id 记在 `observations.jsonl` 的 `event_id`）。保留期以 GitHub 文档为准，所以 `observe` 必须**每日运行**；错过的观测不能补，相应行会一直是 `published_unverified`。
 - **`observations.jsonl` 是本项目对外部记录的转录**，带事件 id 以便核对，它本身不是证据来源。
 - **提交时间（committer time）可以由提交者任意设置**，只作信息展示，不能单独证明「何时公开」。
 - **`runner` 字段**（`github-actions` / `local`）只作信息。
@@ -37,7 +37,7 @@ uv run riskbound track append            # 追加（共识 asof）
 uv run riskbound track append --dry-run  # 只看将写什么
 uv run riskbound track verify            # 文件内校验 + 覆盖报告
 uv run riskbound track verify --prefix-of origin/main:track/daily.jsonl
-uv run riskbound track observe --github OWNER/REPO
+uv run riskbound track observe --github OWNER/REPO   # 默认 --ref refs/heads/main；--activity-file F 读本地 JSON，不联网
 uv run riskbound track verify --public-ref origin/main
 ```
 

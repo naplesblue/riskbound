@@ -366,27 +366,29 @@ def test_5h_publication_states(tmp_path, capsys, monkeypatch):
     commit(repo, "day 4", "2026-10-06T22:00:00+00:00")       # committed early, never pushed
     git(repo, "fetch", "-q", "origin")
 
-    events = [
-        {"id": "9002", "type": "PushEvent", "created_at": "2026-10-06T01:00:00Z",
-         "payload": {"head": c2.upper(), "commits": [{"sha": c2, "author": {"email": "x@example.com"},
-                                                      "message": "day 2", "url": "https://example.invalid"}]}},
-        {"id": "9001", "type": "PushEvent", "created_at": "2026-10-02T02:00:00Z",
-         "payload": {"head": c1, "commits": [{"sha": c1, "message": "day 1"}]}},
-        {"id": "9003", "type": "WatchEvent", "created_at": "2026-10-06T02:00:00Z", "payload": {}},
+    activity = [
+        {"id": 9002, "node_id": "PSH_x", "before": c1, "after": c2.upper(), "ref": "refs/heads/main",
+         "timestamp": "2026-10-06T01:00:00Z", "activity_type": "push",
+         "actor": {"login": "someone", "html_url": "https://example.invalid"}},
+        {"id": 9001, "before": "0" * 40, "after": c1, "ref": "refs/heads/main", "timestamp": "2026-10-02T02:00:00Z",
+         "activity_type": "branch_creation", "actor": {"login": "someone"}},
+        {"id": 9003, "before": c1, "after": c3, "ref": "refs/heads/other", "timestamp": "2026-10-02T03:00:00Z",
+         "activity_type": "push"},
     ]
-    ev_file = tmp_path / "events.json"
-    ev_file.write_text(json.dumps(events))
-    code, out, _ = run(capsys, "track", "observe", "--github", "someone/riskbound", "--events-file", str(ev_file),
+    act_file = tmp_path / "activity.json"
+    act_file.write_text(json.dumps(activity))
+    code, out, _ = run(capsys, "track", "observe", "--github", "someone/riskbound", "--activity-file", str(act_file),
                        "--observations", str(obs))
     assert code == 0 and "recorded 2 new" in out
-    code, out, _ = run(capsys, "track", "observe", "--github", "someone/riskbound", "--events-file", str(ev_file),
-                       "--observations", str(obs))
+    code, out, _ = run(capsys, "track", "observe", "--github", "someone/riskbound", "--activity-file", str(act_file),
+                       "--ref", "refs/heads/main", "--observations", str(obs))
     assert code == 0 and "recorded 0 new" in out           # dedup by event_id
     orows, oerr = track.verify_observations(obs)
     assert oerr is None and [o["event_id"] for o in orows] == ["9001", "9002"]
     assert all(tuple(o) == track.OBS_KEYS for o in orows)
-    assert orows[1]["head_sha"] == c2 and orows[1]["commits"] == [c2] and orows[1]["repo"] == "someone/riskbound"
-    assert "example" not in obs.read_text() and "message" not in obs.read_text()
+    assert orows[1]["head_sha"] == c2 and orows[1]["commits"] == [] and orows[1]["repo"] == "someone/riskbound"
+    assert orows[0]["push_time"] == "2026-10-02T02:00:00+00:00"
+    assert "example" not in obs.read_text() and "someone\"" not in obs.read_text() and "PSH" not in obs.read_text()
 
     code, out, _ = run(capsys, "track", "verify", "--file", str(daily), "--observations", str(obs),
                        "--public-ref", "origin/main", "--repo", str(repo), "--format", "json")
@@ -406,8 +408,8 @@ def test_5h_publication_states(tmp_path, capsys, monkeypatch):
     assert next(r for r in rep["rows_status"] if r["asof"] == "2026-10-05")["commit"] == c3
 
     # an observation whose head descends from c3 covers it through ancestry
-    later = [{"id": "9004", "type": "PushEvent", "created_at": "2026-10-06T12:00:00Z",
-              "payload": {"head": git(repo, "rev-parse", "HEAD"), "commits": []}}]
+    later = [{"id": 9004, "after": git(repo, "rev-parse", "HEAD"), "ref": "refs/heads/main",
+              "timestamp": "2026-10-06T12:00:00Z", "activity_type": "push"}]
     track.observe(obs, later, "someone/riskbound", observed_at="2026-10-06T12:05:00+00:00")
     st = track.public_status(track.verify_daily(daily)[0], track.verify_observations(obs)[0], repo=repo,
                              relpath="track/daily.jsonl", ref="origin/main")
@@ -426,52 +428,145 @@ def test_5h_publication_states(tmp_path, capsys, monkeypatch):
     assert code == 1 and "FAIL public-ref" in out
 
 
+def _act(i, after, when, kind="push", ref="refs/heads/main"):
+    return {"id": i, "after": after, "ref": ref, "timestamp": when, "activity_type": kind}
+
+
+def test_5h_force_push_returns_dropped_commit_to_unpublished(tmp_path, capsys):
+    repo, remote, cache = tmp_path / "repo", tmp_path / "public.git", tmp_path / "cache"
+    git(tmp_path, "init", "-q", "--bare", str(remote))
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "main")
+    git(repo, "config", "user.name", "test")
+    git(repo, "config", "user.email", "test@example.com")
+    git(repo, "remote", "add", "origin", str(remote))
+    daily, obs = repo / "track" / "daily.jsonl", repo / "track" / "observations.jsonl"
+    for asof in ("2026-10-01", "2026-10-02"):
+        write_cache(cache, asof)
+        do_append(daily, cache, today=asof)
+        commit(repo, asof, f"{asof}T22:00:00+00:00")
+    c1, c2 = git(repo, "rev-parse", "HEAD~1"), git(repo, "rev-parse", "HEAD")
+    git(repo, "push", "-q", "origin", "main")
+    track.observe(obs, [_act(1, c2, "2026-10-02T23:00:00Z")], "o/r", observed_at="2026-10-02T23:05:00+00:00")
+    git(repo, "fetch", "-q", "origin")
+    rows = track.verify_daily(daily)[0]
+
+    def states():
+        st = track.public_status(rows, track.verify_observations(obs)[0], repo=repo, relpath="track/daily.jsonl",
+                                 ref="origin/main")
+        return {a: {r["state"] for r in st if r["asof"] == a} for a in ("2026-10-01", "2026-10-02")}
+
+    assert states() == {"2026-10-01": {"late"}, "2026-10-02": {"forward"}}      # deadlines 10-02 / 10-05 13:30Z
+    git(repo, "push", "-q", "--force", "origin", f"{c1}:refs/heads/main")    # c2 dropped from the public branch
+    track.observe(obs, [_act(2, c1, "2026-10-03T01:00:00Z", "force_push"), _act(1, c2, "2026-10-02T23:00:00Z")],
+                  "o/r", observed_at="2026-10-03T01:05:00+00:00")
+    git(repo, "fetch", "-q", "origin")
+    orows = track.verify_observations(obs)[0]
+    assert [(o["event_id"], o["head_sha"]) for o in orows] == [("1", c2), ("2", c1)]
+    st = states()
+    assert st == {"2026-10-01": {"late"}, "2026-10-02": {"unpublished"}}      # observed once, no longer public
+    assert sum(len(v) for v in st.values()) == 2 and len(rows) == 50
+
+
 def test_observe_chain_tamper_refused(tmp_path):
     obs = tmp_path / "o.jsonl"
-    ev = [{"id": "1", "type": "PushEvent", "created_at": "2026-10-02T02:00:00Z", "payload": {"head": "a" * 40}},
-          {"id": "2", "type": "PushEvent", "created_at": "2026-10-03T02:00:00Z", "payload": {"head": "b" * 40}}]
-    track.observe(obs, ev, "o/r", observed_at="2026-10-03T03:00:00+00:00")
+    act = [_act(1, "a" * 40, "2026-10-02T02:00:00Z"), _act(2, "b" * 40, "2026-10-03T02:00:00Z")]
+    track.observe(obs, act, "o/r", observed_at="2026-10-03T03:00:00+00:00")
     lines = obs.read_text().splitlines(keepends=True)
     obs.write_text(lines[1])
     with pytest.raises(track.TrackError, match="refusing"):
-        track.observe(obs, ev, "o/r")
+        track.observe(obs, act, "o/r")
 
 
-def test_parse_events_filters_and_normalizes():
-    ev = [{"id": 5, "type": "PushEvent", "created_at": "2026-10-02T02:00:00Z",
-           "payload": {"head": "A" * 40, "commits": [{"sha": "B" * 40}, {"sha": "not-a-sha"}],
-                       "ref": "refs/heads/main"}},
-          {"id": 6, "type": "PushEvent", "created_at": "2026-10-02T02:00:00Z", "payload": {"head": "zz"}},
-          "garbage"]
-    out = track.parse_events(ev, "o/r", "2026-10-02T03:00:00+00:00")
-    assert out == [{"event_id": "5", "push_time": "2026-10-02T02:00:00+00:00", "head_sha": "a" * 40,
-                    "commits": ["b" * 40], "repo": "o/r", "observed_at": "2026-10-02T03:00:00+00:00"}]
+def test_parse_activity_filters_and_normalizes():
+    items = [
+        {**_act(5, "A" * 40, "2026-10-02T02:00:00Z"), "node_id": "PSH_x", "before": "c" * 40,
+         "actor": {"login": "someone", "id": 1}},
+        _act(6, "b" * 40, "2026-10-02T03:00:00.000+00:00", "force_push"),
+        _act(7, "c" * 40, "2026-10-01T22:00:00-04:00", "branch_creation"),
+        _act(8, "0" * 40, "2026-10-02T04:00:00Z", "branch_deletion"),     # not a new head
+        _act(9, "d" * 40, "2026-10-02T05:00:00Z", "pr_merge"),            # type not observed
+        _act(10, "e" * 40, "2026-10-02T06:00:00Z", ref="refs/heads/dev"),  # other ref
+        _act(11, "zz", "2026-10-02T07:00:00Z"),                            # invalid after
+        _act(12, "f" * 39, "2026-10-02T07:00:00Z"),                        # invalid after (39 hex)
+        _act(13, "f" * 40, "not a time"),                                  # invalid timestamp
+        _act(14, "f" * 40, "2026-10-02T07:00:00"),                         # timestamp without timezone
+        {k: v for k, v in _act(15, "f" * 40, "2026-10-02T07:00:00Z").items() if k != "id"},
+        "garbage",
+    ]
+    out = track.parse_activity(items, "refs/heads/main")
+    assert out == [
+        {"event_id": "5", "push_time": "2026-10-02T02:00:00+00:00", "head_sha": "a" * 40, "commits": []},
+        {"event_id": "6", "push_time": "2026-10-02T03:00:00+00:00", "head_sha": "b" * 40, "commits": []},
+        {"event_id": "7", "push_time": "2026-10-02T02:00:00+00:00", "head_sha": "c" * 40, "commits": []},
+    ]
+    assert track.parse_activity({"message": "Not Found"}, "refs/heads/main") == []
+    assert track.parse_activity(items, "refs/heads/dev") == [
+        {"event_id": "10", "push_time": "2026-10-02T06:00:00+00:00", "head_sha": "e" * 40, "commits": []}]
 
 
-def test_fetch_github_events_with_injected_response():
-    seen = {}
+class _Resp:
+    def __init__(self, body, link=None):
+        self.body, self.headers = body, ({"Link": link} if link else {})
 
-    class Resp:
-        def __enter__(self):
-            return self
+    def __enter__(self):
+        return self
 
-        def __exit__(self, *a):
-            return False
+    def __exit__(self, *a):
+        return False
 
-        def read(self):
-            return b'[{"id": "1", "type": "PushEvent"}]'
+    def read(self):
+        return json.dumps(self.body).encode()
+
+
+def test_fetch_github_activity_with_injected_response():
+    seen = []
 
     def opener(req, timeout):
-        seen["url"], seen["auth"], seen["timeout"] = req.full_url, req.get_header("Authorization"), timeout
-        return Resp()
+        seen.append((req.full_url, req.get_header("Authorization"), req.get_header("Accept"), timeout))
+        return _Resp([{"id": 1, "activity_type": "push"}])
 
-    assert track.fetch_github_events("o/r", "tok", opener=opener) == [{"id": "1", "type": "PushEvent"}]
-    assert seen == {"url": "https://api.github.com/repos/o/r/events?per_page=100", "auth": "Bearer tok",
-                    "timeout": 30}
-    track.fetch_github_events("o/r", None, opener=opener)
-    assert seen["auth"] is None
+    assert track.fetch_github_activity("o/r", "refs/heads/main", "tok", opener=opener) == \
+        [{"id": 1, "activity_type": "push"}]
+    assert seen == [("https://api.github.com/repos/o/r/activity?per_page=100&ref=refs/heads/main", "Bearer tok",
+                     "application/vnd.github+json", 30)]
+    track.fetch_github_activity("o/r", opener=opener)
+    assert seen[-1][1] is None and seen[-1][0].endswith("&ref=refs/heads/main")
     with pytest.raises(track.TrackError):
-        track.fetch_github_events("not a repo", None, opener=opener)
+        track.fetch_github_activity("not a repo", opener=opener)
+    with pytest.raises(track.TrackError, match="not a JSON array"):
+        track.fetch_github_activity("o/r", opener=lambda req, timeout: _Resp({"message": "Bad credentials"}))
+
+
+def test_fetch_github_activity_follows_next_link():
+    base = "https://api.github.com/repositories/42/activity?per_page=100&ref=refs%2Fheads%2Fmain"
+    pages = {
+        "https://api.github.com/repos/o/r/activity?per_page=100&ref=refs/heads/main":
+            _Resp([{"id": 3}, {"id": 2}], f'<{base}&after=c2>; rel="next", <{base}&before=c0>; rel="prev"'),
+        f"{base}&after=c2": _Resp([{"id": 1}], f'<{base}&before=c1>; rel="prev"'),
+    }
+    seen = []
+
+    def opener(req, timeout):
+        seen.append((req.full_url, req.get_header("Authorization")))
+        return pages[req.full_url]
+
+    assert track.fetch_github_activity("o/r", token="tok", opener=opener) == [{"id": 3}, {"id": 2}, {"id": 1}]
+    assert [u for u, _ in seen] == list(pages) and all(a == "Bearer tok" for _, a in seen)
+
+    calls = []
+
+    def endless(req, timeout):
+        calls.append(req.full_url)
+        return _Resp([{"id": len(calls)}], f'<{base}&after=p{len(calls)}>; rel="next"')
+
+    assert len(track.fetch_github_activity("o/r", opener=endless, max_pages=3)) == 3 and len(calls) == 3
+
+    def foreign(req, timeout):
+        return _Resp([], '<https://evil.example/activity?page=2>; rel="next"')
+
+    with pytest.raises(track.TrackError, match="outside"):
+        track.fetch_github_activity("o/r", token="tok", opener=foreign)
 
 
 # ---------------------------------------------------------------- cli wiring

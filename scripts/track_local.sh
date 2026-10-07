@@ -5,8 +5,8 @@
 #   git push
 #   uv run riskbound track observe --github OWNER/REPO
 #   git add track/observations.jsonl && git commit -m "track: observe $(date -u +%F)" && git push
-# A row only counts as forward evidence once a recorded PushEvent shows it reached the public remote
-# before its deadline (see track/README.md).
+# A row only counts as forward evidence once a recorded push (GitHub repository activity API) shows it reached
+# the public remote before its deadline (see track/README.md).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

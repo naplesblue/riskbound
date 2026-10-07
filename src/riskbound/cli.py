@@ -279,10 +279,12 @@ def _track_parser() -> argparse.ArgumentParser:
     vp.add_argument("--public-ref", default=None, metavar="REF", help="classify rows against a public git ref")
     vp.add_argument("--repo", type=Path, default=Path("."), metavar="DIR", help="git repository (default .)")
     vp.add_argument("--format", choices=("table", "json"), default="table")
-    op = sub.add_parser("observe", help="record GitHub PushEvents in the observations log")
-    op.add_argument("--github", required=True, metavar="OWNER/REPO", help="repository the events belong to")
-    op.add_argument("--events-file", type=Path, default=None,
-                    help="read events from a local JSON file instead of the GitHub API")
+    op = sub.add_parser("observe", help="record pushes from the GitHub repository activity API in the "
+                        "observations log")
+    op.add_argument("--github", required=True, metavar="OWNER/REPO", help="repository the activity belongs to")
+    op.add_argument("--ref", default=track.DEFAULT_REF, help=f"ref to observe (default {track.DEFAULT_REF})")
+    op.add_argument("--activity-file", type=Path, default=None,
+                    help="read a JSON array of activity entries from a local file instead of the GitHub API")
     op.add_argument("--observations", type=Path, default=track.OBS_FILE)
     return p
 
@@ -370,15 +372,15 @@ def _track_verify(a: argparse.Namespace) -> int:
 
 def _track_observe(a: argparse.Namespace) -> int:
     try:
-        if a.events_file is not None:
-            events = json.loads(a.events_file.read_text(encoding="utf-8"))
+        if a.activity_file is not None:
+            activity = json.loads(a.activity_file.read_text(encoding="utf-8"))
         else:
-            events = track.fetch_github_events(a.github, os.environ.get("GITHUB_TOKEN"))
-        new = track.observe(a.observations, events, a.github)
+            activity = track.fetch_github_activity(a.github, a.ref, os.environ.get("GITHUB_TOKEN"))
+        new = track.observe(a.observations, activity, a.github, a.ref)
     except (track.TrackError, OSError, ValueError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
-    print(f"recorded {len(new)} new PushEvent observation(s) in {a.observations}")
+    print(f"recorded {len(new)} new push observation(s) of {a.ref} in {a.observations}")
     return 0
 
 

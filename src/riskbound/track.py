@@ -1,8 +1,8 @@
 """Forward log: append-only, auditable, verifiable daily records of the default rule on the backtest universe.
 
 - `track/daily.jsonl`: one row per (asof, symbol), fixed key order, sha256 hash chain (prev_hash / row_hash).
-- `track/observations.jsonl`: transcripts of GitHub PushEvents (when a commit reached the public remote),
-  same hash-chain rules, independent chain.
+- `track/observations.jsonl`: transcripts of GitHub repository activity entries (push / force_push /
+  branch_creation: when a new head reached the public remote), same hash-chain rules, independent chain.
 
 Integrity checks have two levels. In-file verification recomputes every row hash and the prev_hash chain; it
 detects modified or deleted *inner* rows but not truncation of the tail. `--prefix-of` compares against a
@@ -10,9 +10,9 @@ reference version (a file or a git ref); it detects tail truncation and any rewr
 
 Publication status of a row (only `forward` counts as forward evidence):
 - unpublished: the commit introducing the row is not reachable from the public ref;
-- published_unverified: reachable, but no recorded PushEvent covers that commit;
-- late: the earliest covering PushEvent happened after the deadline;
-- forward: the earliest covering PushEvent happened at or before the deadline.
+- published_unverified: reachable, but no recorded push observation covers that commit;
+- late: the earliest covering push observation happened after the deadline;
+- forward: the earliest covering push observation happened at or before the deadline.
 deadline(asof) = 09:30 US/Eastern on the first Monday-Friday after asof (holidays are not modelled, which is
 conservative). Commit timestamps are informational only.
 """
@@ -26,6 +26,7 @@ import os
 import re
 import subprocess
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -43,6 +44,10 @@ OBS_KEYS = ("event_id", "push_time", "head_sha", "commits", "repo", "observed_at
 STATES = ("unpublished", "published_unverified", "late", "forward")
 UTC = datetime.timezone.utc
 _SHA = re.compile(r"^[0-9a-f]{40}$")
+GITHUB_API = "https://api.github.com"
+DEFAULT_REF = "refs/heads/main"
+ACTIVITY_TYPES = ("push", "force_push", "branch_creation")
+_NEXT = re.compile(r'<([^>]+)>\s*;\s*rel="next"')
 
 
 class TrackError(Exception):
@@ -317,46 +322,73 @@ def _sha(x) -> str | None:
     return s if _SHA.match(s) else None
 
 
-def parse_events(events: list, repo: str, observed_at: str) -> list[dict]:
-    """PushEvents only; keeps id, created_at, head and commit SHAs. Nothing else from the event is stored."""
+def parse_activity(items: list, ref: str) -> list[dict]:
+    """Repository activities that set `ref` to a new head (push, force_push, branch_creation).
+
+    Keeps the activity id, its timestamp (when GitHub received the push) and the `after` SHA. The activity API
+    lists no commits, so `commits` is always empty; coverage relies on head_sha equality or ancestry. Actor,
+    node_id and URLs are not stored. Entries with an invalid SHA, id or timestamp are dropped.
+    """
     out = []
-    for e in events if isinstance(events, list) else []:
-        if not isinstance(e, dict) or e.get("type") != "PushEvent":
+    for a in items if isinstance(items, list) else []:
+        if not isinstance(a, dict) or a.get("activity_type") not in ACTIVITY_TYPES or a.get("ref") != ref:
             continue
-        payload = e.get("payload") or {}
-        head = _sha(payload.get("head"))
-        if head is None or not e.get("id") or not e.get("created_at"):
+        head = _sha(a.get("after"))
+        if head is None or not isinstance(a.get("id"), (int, str)) or a.get("id") == "":
             continue
-        commits = [s for s in (_sha(c.get("sha")) for c in payload.get("commits") or [] if isinstance(c, dict)) if s]
-        out.append({"event_id": str(e["id"]), "push_time": _parse_time(e["created_at"]).isoformat(),
-                    "head_sha": head, "commits": commits, "repo": repo, "observed_at": observed_at})
+        try:
+            when = _parse_time(a["timestamp"]).isoformat(timespec="seconds")
+        except (KeyError, TypeError, ValueError):
+            continue
+        out.append({"event_id": str(a["id"]), "push_time": when, "head_sha": head, "commits": []})
     return out
 
 
-def fetch_github_events(repo: str, token: str | None = None, opener=urllib.request.urlopen, timeout: float = 30):
-    """GET /repos/{owner}/{repo}/events (first page, up to 100 events)."""
+def _next_link(headers) -> str | None:
+    m = _NEXT.search((headers.get("Link") if headers is not None else None) or "")
+    return m.group(1) if m else None
+
+
+def fetch_github_activity(repo: str, ref: str = DEFAULT_REF, token: str | None = None, opener=None,
+                          max_pages: int = 10, timeout: float = 30) -> list:
+    """GET /repos/{owner}/{repo}/activity for one ref, following `Link: rel="next"` for at most max_pages pages."""
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
         raise TrackError(f"expected OWNER/REPO, got {repo!r}")
-    req = urllib.request.Request(f"https://api.github.com/repos/{repo}/events?per_page=100",
-                                 headers={"Accept": "application/vnd.github+json", "User-Agent": "riskbound-track"})
-    if token:
-        req.add_header("Authorization", f"Bearer {token}")
-    with opener(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    opener = opener or urllib.request.urlopen
+    url = f"{GITHUB_API}/repos/{repo}/activity?per_page=100&ref={urllib.parse.quote(ref, safe='/')}"
+    items: list = []
+    for _ in range(max_pages):
+        req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json",
+                                                   "User-Agent": "riskbound-track"})
+        if token:
+            req.add_header("Authorization", f"Bearer {token}")
+        with opener(req, timeout=timeout) as resp:
+            page = json.loads(resp.read().decode("utf-8"))
+            nxt = _next_link(getattr(resp, "headers", None))
+        if not isinstance(page, list):
+            raise TrackError(f"unexpected activity response from {url}: not a JSON array")
+        items.extend(page)
+        if nxt is None:
+            break
+        if not nxt.startswith(GITHUB_API + "/"):
+            raise TrackError(f"refusing to follow pagination link outside {GITHUB_API}: {nxt}")
+        url = nxt
+    return items
 
 
-def observe(path: Path, events: list, repo: str, observed_at: str | None = None) -> list[dict]:
-    """Append new PushEvent observations (dedup by event_id, oldest first). Returns the appended rows."""
+def observe(path: Path, activity: list, repo: str, ref: str = DEFAULT_REF, observed_at: str | None = None) -> list[dict]:
+    """Append new push observations of `ref` (dedup by event_id, oldest first). Returns the appended rows."""
     lines = read_lines(path)
     existing, err = verify_observations(path)
     if err:
         raise TrackError(f"{path}: verification failed ({err}); refusing to append. Restore the file from git "
                          "history before appending.")
     seen = {r["event_id"] for r in existing}
+    at = observed_at or _now_utc()
     fresh = {}
-    for o in parse_events(events, repo, observed_at or _now_utc()):
+    for o in parse_activity(activity, ref):
         if o["event_id"] not in seen and o["event_id"] not in fresh:
-            fresh[o["event_id"]] = o
+            fresh[o["event_id"]] = {**o, "repo": repo, "observed_at": at}
     prev = existing[-1]["row_hash"] if existing else ZERO_HASH
     new_rows = []
     for o in sorted(fresh.values(), key=lambda o: (o["push_time"], o["event_id"])):
