@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Environments
+.venv/
+
+# Market data caches (never distributed)
+*.csv
+.cache/
+bars/
+
+# OS
+.DS_Store
+
+# internal working records (plans, reviews, decision log) — not distributed
+docs/plans/
+docs/product-decisions.md

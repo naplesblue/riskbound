@@ -1,0 +1,28 @@
+[project]
+name = "riskbound"
+version = "0.1.0.dev0"
+description = "Position-sizing rules with explicit evidence boundaries."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=2.4",
+    "pandas>=3.0",
+    "yfinance>=1.2",
+]
+
+[project.scripts]
+riskbound = "riskbound.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=9",
+]
+
+[build-system]
+requires = ["uv_build>=0.9.14,<0.10.0"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

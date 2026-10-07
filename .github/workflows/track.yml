@@ -1,0 +1,64 @@
+# Forward log: append one row per symbol for the consensus asof, verify, commit; then record the PushEvent.
+# This workflow does not run until the repository is pushed to GitHub, and enabling it requires
+# confirmation by the repository owner. The schedule is in UTC: 02:30 UTC Tuesday-Saturday is about
+# 21:30-22:30 US/Eastern the previous evening, after the Monday-Friday close has settled.
+
+name: track
+
+on:
+  schedule:
+    - cron: "30 2 * * 2-6"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: track
+  cancel-in-progress: false
+
+jobs:
+  append:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync
+      - run: uv run riskbound track append --cache-dir .cache/bars
+      - run: uv run riskbound track verify
+      - name: Commit new rows
+        run: |
+          if [ -n "$(git status --porcelain track/daily.jsonl)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add track/daily.jsonl
+            git commit -m "track: append $(date -u +%F)"
+            git push
+          fi
+
+  observe:
+    needs: append
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.ref }}
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync
+      - run: git pull --ff-only
+      - run: uv run riskbound track observe --github ${{ github.repository }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - run: uv run riskbound track verify
+      - name: Commit new observations
+        run: |
+          if [ -n "$(git status --porcelain track/observations.jsonl)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add track/observations.jsonl
+            git commit -m "track: observe $(date -u +%F)"
+            git push
+          fi
